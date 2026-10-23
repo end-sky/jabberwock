@@ -1,4 +1,4 @@
-// jabberwock is a tiny terminal YouTube and SoundCloud client. It uses only
+// jabberwock is a tiny terminal YouTube, SoundCloud, and Genius client. It uses only
 // the Go standard library; mpv and optionally cava handle playback/visuals.
 package main
 
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"unsafe"
 
+	"jabberwock/genius"
 	"jabberwock/soundcloud"
 )
 
@@ -40,16 +42,22 @@ type App struct {
 	view           int
 	filterRow      int
 	settingRow     int
-	inputMode      string // "search" or "instance"
+	inputMode      string // search / instance / Soundcloak preference
 	input          []rune
 	notice         string
 	fatalErr       error
 	quit           bool
 	term           terminal
-	provider       string // "youtube" or "soundcloud"
+	provider       string // youtube, soundcloud, or genius
 	sourcePicker   bool
 	sourceSelected int
-	scClient       soundcloud.Client
+	scCloak        soundcloud.CloakClient
+	scDirect       soundcloud.Client
+	geniusClient   genius.Client
+	lyricsOpen     bool
+	lyrics         string
+	lyricsSong     Video
+	lyricsScroll   int
 }
 
 type terminal struct {
@@ -74,7 +82,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "jabberwock:", err)
 		os.Exit(1)
 	}
-	app := &App{cfg: cfg, cfgPath: cfgPath, filters: DefaultFilters(), view: viewVideos, sourcePicker: true, scClient: soundcloud.Client{ClientID: cfg.SoundCloudClientID}, notice: "Choose YouTube or SoundCloud with ↑/↓, then press Enter."}
+	app := &App{cfg: cfg, cfgPath: cfgPath, filters: DefaultFilters(), view: viewVideos, sourcePicker: true, scCloak: soundcloud.CloakClient{InstancesURL: cfg.SoundCloudInstancesURL, PreferredBase: cfg.SoundCloudInstance}, scDirect: soundcloud.Client{ClientID: cfg.SoundCloudClientID}, geniusClient: genius.Client{UseAPI: cfg.UseAPIs, Frontend: cfg.GeniusFrontend}, notice: "Choose YouTube, SoundCloud, or Genius with ↑/↓, then press Enter."}
 	app.term = terminal{fd: int(os.Stdin.Fd())}
 	if err := app.term.enable(); err != nil {
 		fmt.Fprintln(os.Stderr, "jabberwock: cannot enter terminal mode:", err)
@@ -91,7 +99,7 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Println(`jabberwock — tiny terminal YouTube + SoundCloud client
+	fmt.Println(`jabberwock — lightweight terminal YouTube, SoundCloud, and Genius client
 
 Run: go run .
 Build: go build -o jabberwock .
@@ -100,13 +108,11 @@ Requires an interactive terminal. Playback is delegated to mpv; for YouTube
 URLs, mpv generally needs yt-dlp installed as well. No Go modules are required.
 Settings: ~/.config/jabberwock/config.json (or $JABBERWOCK_CONFIG).
 
-At startup, choose YouTube or SoundCloud. Ctrl+P opens that chooser again.
-YouTube uses HTML scraping or the Invidious API. SoundCloud discovers its public
-client ID and filters blocked/Go-only tracks. If discovery fails, set
-soundcloud_client_id in config.json or JABBERWOCK_SC_CLIENT_ID. SoundCloud playback
-uses mpv; CAVA is optional for terminal audio visuals. Press Esc during either kind
-of playback to stop the media processes and return to the previous page. No history
-or subscriptions are stored.`)
+At startup, choose YouTube, SoundCloud, or Genius. Ctrl+P opens that chooser again.
+Settings > Load through APIs toggles all providers: off scrapes original sites directly; on uses Invidious, Soundcloak, and Dumb/Intellectual instances. Genius displays lyrics in the terminal; press c to copy all lyrics. mpv handles
+playback and CAVA is optional for SoundCloud visualizations. Press Esc during playback
+to stop media processes and return to the previous page. Ctrl+H returns to Home. No
+history or subscriptions are stored.`)
 }
 
 func isTerminal(file *os.File) bool {
@@ -209,8 +215,10 @@ func readKey() string {
 		return "ctrl+q"
 	case 0x03:
 		return "ctrl+c"
-	case 0x7f, 0x08:
+	case 0x7f:
 		return "backspace"
+	case 0x08:
+		return "ctrl+h"
 	case '\r', '\n':
 		return "enter"
 	case '\t':
@@ -278,6 +286,28 @@ func (a *App) handleKey(key string) {
 	if key == "" {
 		return
 	}
+	if a.lyricsOpen {
+		switch key {
+		case "esc":
+			a.lyricsOpen = false
+			a.notice = "Returned to Genius search results."
+			return
+		case "up", "k":
+			if a.lyricsScroll > 0 {
+				a.lyricsScroll--
+			}
+			return
+		case "down", "j":
+			a.lyricsScroll++
+			return
+		case "enter", "c", "C":
+			a.copyLyrics()
+			return
+		}
+		if key != "ctrl+h" {
+			return
+		}
+	}
 	if a.sourcePicker {
 		a.handleSourcePickerKey(key)
 		return
@@ -313,6 +343,8 @@ func (a *App) handleKey(key string) {
 		filterCount := len(filterOptions)
 		if a.provider == "soundcloud" {
 			filterCount = 3
+		} else if a.provider == "genius" {
+			filterCount = 1
 		}
 		switch key {
 		case "up", "k":
@@ -327,9 +359,9 @@ func (a *App) handleKey(key string) {
 	case viewSettings:
 		switch key {
 		case "up", "k":
-			a.settingRow = (a.settingRow + 3) % 4
+			a.settingRow = (a.settingRow + 4) % 5
 		case "down", "j":
-			a.settingRow = (a.settingRow + 1) % 4
+			a.settingRow = (a.settingRow + 1) % 5
 		case "left":
 			a.cycleSetting(-1)
 		case "right", "enter":
@@ -340,19 +372,28 @@ func (a *App) handleKey(key string) {
 
 func (a *App) handleSourcePickerKey(key string) {
 	switch key {
-	case "up", "down", "left", "right":
-		a.sourceSelected = 1 - a.sourceSelected
+	case "up", "left":
+		a.sourceSelected = (a.sourceSelected + 2) % 3
+	case "down", "right":
+		a.sourceSelected = (a.sourceSelected + 1) % 3
 	case "enter":
-		if a.sourceSelected == 1 {
+		switch a.sourceSelected {
+		case 1:
 			a.provider = "soundcloud"
-			a.notice = "SoundCloud selected. Ctrl+S searches tracks; Enter plays audio."
-		} else {
+			a.notice = "SoundCloud selected. Ctrl+S searches tracks; Enter plays audio. API mode selects Soundcloak/direct scraping."
+		case 2:
+			a.provider = "genius"
+			a.notice = "Genius selected. Ctrl+S searches songs; Enter opens lyrics."
+		default:
 			a.provider = "youtube"
 			a.notice = "YouTube selected. Ctrl+S searches videos; Enter plays with mpv."
 		}
 		a.sourcePicker = false
 		if a.provider == "soundcloud" && a.filterRow > 2 {
 			a.filterRow = 2
+		}
+		if a.provider == "genius" {
+			a.filterRow = 0
 		}
 		a.query = ""
 		a.videos = nil
@@ -361,6 +402,11 @@ func (a *App) handleSourcePickerKey(key string) {
 		a.hasMore = false
 	case "ctrl+q", "ctrl+c":
 		a.quit = true
+	case "ctrl+h":
+		if a.provider == "" {
+			a.provider = "youtube"
+		}
+		a.dispatchAction("home")
 	case "esc":
 		if a.provider != "" {
 			a.sourcePicker = false
@@ -381,7 +427,21 @@ func (a *App) dispatchAction(action string) {
 		if a.provider == "soundcloud" {
 			a.sourceSelected = 1
 		}
+		if a.provider == "genius" {
+			a.sourceSelected = 2
+		}
 		a.sourcePicker = true
+	case "home":
+		if a.provider == "" {
+			a.provider = "youtube"
+		}
+		a.lyricsOpen = false
+		a.sourcePicker = false
+		a.inputMode = ""
+		a.view = viewVideos
+		a.selected = 0
+		a.lyricsScroll = 0
+		a.notice = "Returned to Home. Ctrl+S searches; Ctrl+P switches source."
 	case "refresh":
 		if strings.TrimSpace(a.query) == "" {
 			a.notice = "Search first with Ctrl+S."
@@ -414,10 +474,15 @@ func (a *App) beginInput(mode string) {
 	if mode == "sc_client_id" {
 		a.input = []rune(a.cfg.SoundCloudClientID)
 	}
+	if mode == "soundcloak_instance" {
+		a.input = []rune(a.cfg.SoundCloudInstance)
+	}
 	if mode == "search" {
 		a.notice = "Type a query and press Enter; Esc cancels."
 	} else if mode == "sc_client_id" {
 		a.notice = "Set a SoundCloud client ID, or clear it to auto-detect; press Enter."
+	} else if mode == "soundcloak_instance" {
+		a.notice = "Optional preferred Soundcloak base URL; empty selects automatically."
 	} else {
 		a.notice = "Edit the Invidious base URL, then press Enter."
 	}
@@ -428,6 +493,8 @@ func (a *App) handleInputKey(key string) {
 	case "esc":
 		a.inputMode = ""
 		a.notice = "Input cancelled."
+	case "ctrl+h":
+		a.dispatchAction("home")
 	case "enter":
 		value := strings.TrimSpace(string(a.input))
 		mode := a.inputMode
@@ -443,8 +510,15 @@ func (a *App) handleInputKey(key string) {
 			a.performSearch()
 		} else if mode == "sc_client_id" {
 			a.cfg.SoundCloudClientID = value
-			a.scClient.ClientID = value
-			a.saveConfig("SoundCloud client ID updated; empty means auto-detect.")
+			a.saveConfig("Legacy SoundCloud client ID setting updated; Soundcloak is used for searches.")
+		} else if mode == "soundcloak_instance" {
+			if value != "" && !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
+				a.notice = "Soundcloak URL must start with https:// or http://, or be empty for automatic selection."
+				return
+			}
+			a.cfg.SoundCloudInstance = strings.TrimRight(value, "/")
+			a.scCloak.PreferredBase = a.cfg.SoundCloudInstance
+			a.saveConfig("Soundcloak preferred instance updated.")
 		} else if mode == "instance" {
 			if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
 				a.notice = "URL must start with https:// or http://. Setting was not changed."
@@ -490,6 +564,10 @@ func (a *App) moveSelection(delta int) {
 }
 
 func (a *App) cycleFilter(direction int) {
+	if a.provider == "genius" {
+		a.notice = "Genius search uses relevance ranking; extra filters are not applicable."
+		return
+	}
 	if direction > 0 {
 		a.filters.cycle(a.filterRow)
 	} else {
@@ -524,19 +602,18 @@ func (a *App) cycleFilter(direction int) {
 func (a *App) cycleSetting(direction int) {
 	switch a.settingRow {
 	case 0:
-		if a.cfg.Backend == "local" {
+		a.cfg.UseAPIs = !a.cfg.UseAPIs
+		if a.cfg.UseAPIs {
 			a.cfg.Backend = "invidious"
 		} else {
 			a.cfg.Backend = "local"
 		}
-		a.saveConfig("YouTube backend changed to " + a.cfg.Backend + ".")
-		if a.query != "" && a.provider != "soundcloud" {
+		a.saveConfig("API mode " + onOff(a.cfg.UseAPIs) + ". YouTube, SoundCloud, and Genius now use the selected loading mode.")
+		if a.query != "" {
 			a.performSearch()
 		}
 	case 1:
-		if direction < 0 || direction > 0 {
-			a.beginInput("instance")
-		}
+		a.beginInput("instance")
 	case 2:
 		names := a.cfg.themeNames()
 		if len(names) == 0 {
@@ -566,7 +643,23 @@ func (a *App) cycleSetting(direction int) {
 			a.saveConfig("Theme changed to " + a.cfg.Theme + ".")
 		}
 	case 3:
-		a.beginInput("sc_client_id")
+		a.beginInput("soundcloak_instance")
+	case 4:
+		frontends := []string{"auto", "dumb", "intellectual"}
+		pos := 0
+		for i, name := range frontends {
+			if name == a.cfg.GeniusFrontend {
+				pos = i
+				break
+			}
+		}
+		if direction >= 0 {
+			pos = (pos + 1) % len(frontends)
+		} else {
+			pos = (pos + len(frontends) - 1) % len(frontends)
+		}
+		a.cfg.GeniusFrontend = frontends[pos]
+		a.saveConfig("Genius frontend preference changed to " + a.cfg.GeniusFrontend + ".")
 	}
 }
 
@@ -602,6 +695,10 @@ func (a *App) loadNextPage() {
 func (a *App) fetchSearchPage(next bool) {
 	if a.provider == "soundcloud" {
 		a.fetchSoundCloudPage(next)
+		return
+	}
+	if a.provider == "genius" {
+		a.fetchGeniusPage()
 		return
 	}
 	page := 1
@@ -669,15 +766,25 @@ func (a *App) fetchSoundCloudPage(next bool) {
 		nextURL = a.cursor.SoundCloudNextURL
 		a.notice = fmt.Sprintf("Loading SoundCloud page %d…", a.page+1)
 	} else {
-		a.notice = "Searching SoundCloud tracks…"
+		if a.cfg.UseAPIs {
+			a.notice = "Searching SoundCloud through Soundcloak…"
+		} else {
+			a.notice = "Searching SoundCloud directly…"
+		}
 	}
 	a.render()
 	ctx, cancel := context.WithTimeout(context.Background(), 28*time.Second)
 	defer cancel()
-	if a.scClient.ClientID != a.cfg.SoundCloudClientID {
-		a.scClient.ClientID = a.cfg.SoundCloudClientID
+	a.scCloak.InstancesURL = a.cfg.SoundCloudInstancesURL
+	a.scCloak.PreferredBase = a.cfg.SoundCloudInstance
+	var result soundcloud.SearchPage
+	var err error
+	if a.cfg.UseAPIs {
+		result, err = a.scCloak.Search(ctx, a.query, offset, 20, nextURL)
+	} else {
+		a.scDirect.ClientID = a.cfg.SoundCloudClientID
+		result, err = a.scDirect.Search(ctx, a.query, offset, 20, nextURL)
 	}
-	result, err := a.scClient.Search(ctx, a.query, offset, 20, nextURL)
 	if err != nil {
 		a.notice = "SoundCloud search failed: " + err.Error()
 		if !next {
@@ -767,6 +874,10 @@ func (a *App) playSelected() {
 		return
 	}
 	video := a.videos[a.selected]
+	if a.provider == "genius" {
+		a.openLyrics(video)
+		return
+	}
 	if video.IsTrack {
 		a.playSoundCloudTrack(video)
 		return
@@ -798,30 +909,23 @@ func (a *App) playSoundCloudTrack(track Video) {
 		return
 	}
 
-	// SoundCloud's media.transcodings URL is an API endpoint, not usually the
-	// actual audio file. Resolve it to a signed CDN URL/playlist before giving
-	// it to mpv. This is also required for current AAC/HLS streams.
-	a.notice = "Resolving SoundCloud audio stream…"
-	a.render()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	streamURL, err := a.scClient.ResolveStreamURL(ctx, track.StreamURL)
-	cancel()
-	if err != nil {
-		a.notice = "SoundCloud stream resolution failed: " + err.Error()
-		return
-	}
-
+	// Soundcloak's restream/progressive endpoint provides a stable proxied
+	// stream and renews upstream SoundCloud URLs on the server side.
 	var mpvLog bytes.Buffer
-	mpv := exec.Command("mpv", "--no-video", "--force-window=no", "--no-terminal", "--input-terminal=no", "--msg-level=all=warn", "--", streamURL)
+	mpv := exec.Command("mpv", "--no-video", "--force-window=no", "--no-terminal", "--input-terminal=no", "--msg-level=all=warn", "--", track.StreamURL)
 	mpv.Stdin = nil
 	mpv.Stdout, mpv.Stderr = &mpvLog, &mpvLog
 
-	var cava *exec.Cmd
+	var cavaAttempts []cavaAttempt
 	if cavaPath, lookupErr := exec.LookPath("cava"); lookupErr == nil {
-		cava = exec.Command(cavaPath)
-		cava.Stdin, cava.Stdout, cava.Stderr = nil, os.Stdout, os.Stderr
+		cavaAttempts = newCAVACommands(cavaPath)
+		for i := range cavaAttempts {
+			cavaAttempts[i].cmd.Stdin = nil
+			cavaAttempts[i].cmd.Stdout, cavaAttempts[i].cmd.Stderr = os.Stdout, os.Stderr
+			defer cavaAttempts[i].cleanup()
+		}
 	}
-	stopped, playErr, visualErr := a.runManagedPlayback(mpv, cava, "SoundCloud: "+track.Title+" — "+track.Author)
+	stopped, playErr, visualErr := a.runManagedPlayback(mpv, cavaAttempts, "SoundCloud: "+track.Title+" — "+track.Author)
 	if stopped {
 		a.notice = "Playback stopped. Returned to your results."
 		return
@@ -851,6 +955,113 @@ func firstLine(value string) string {
 		value = value[:117] + "..."
 	}
 	return value
+}
+
+// cavaAttempt pairs one input backend with its temporary configuration. CAVA
+// builds vary in which capture backends are compiled in, so playback can try
+// more than one rather than silently giving up on the first unsupported method.
+type cavaAttempt struct {
+	cmd     *exec.Cmd
+	cleanup func()
+	method  string
+}
+
+// newCAVACommands returns likely working audio-capture backends first. PipeWire
+// is preferred when its socket exists; PulseAudio compatibility is tried next.
+// If detection is inconclusive, preserve the user's normal CAVA config first.
+func newCAVACommands(cavaPath string) []cavaAttempt {
+	methods := detectCAVAAudioMethods()
+	attempts := make([]cavaAttempt, 0, len(methods))
+	seen := map[string]bool{}
+	for _, method := range methods {
+		if method == "default" {
+			attempts = append(attempts, cavaAttempt{cmd: exec.Command(cavaPath), cleanup: func() {}, method: method})
+			continue
+		}
+		if seen[method] {
+			continue
+		}
+		seen[method] = true
+		cmd, cleanup := newCAVACommandForMethod(cavaPath, method)
+		attempts = append(attempts, cavaAttempt{cmd: cmd, cleanup: cleanup, method: method})
+	}
+	if len(attempts) == 0 {
+		return []cavaAttempt{{cmd: exec.Command(cavaPath), cleanup: func() {}, method: "default"}}
+	}
+	return attempts
+}
+
+func newCAVACommandForMethod(cavaPath, method string) (*exec.Cmd, func()) {
+	config := cavaConfig(method)
+	f, err := os.CreateTemp("", "jabberwock-cava-*.conf")
+	if err != nil {
+		return exec.Command(cavaPath), func() {}
+	}
+	name := f.Name()
+	if _, err = f.WriteString(config); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return exec.Command(cavaPath), func() {}
+	}
+	if err = f.Close(); err != nil {
+		_ = os.Remove(name)
+		return exec.Command(cavaPath), func() {}
+	}
+	return exec.Command(cavaPath, "-p", name), func() { _ = os.Remove(name) }
+}
+
+func cavaConfig(method string) string {
+	active := ""
+	if method == "pipewire" {
+		active = "active = 1\n"
+	}
+	return fmt.Sprintf(`[general]
+framerate = 60
+autosens = 1
+sleep_timer = 0
+
+[input]
+method = %s
+source = auto
+%s
+[output]
+method = noncurses
+orientation = bottom
+bar_width = 2
+bar_spacing = 1
+`, method, active)
+}
+
+func detectCAVAAudioMethods() []string {
+	// Prefer CAVA's own working user configuration first. Previously jabberwock
+	// forced an inferred backend and accepted it merely because the process stayed
+	// alive, which could leave a silent visualizer and never try the user's config.
+	methods := []string{"default"}
+	runtimeDir := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
+	pipewireAvailable := false
+	pulseSocket := false
+	if runtimeDir != "" {
+		if _, err := os.Stat(filepath.Join(runtimeDir, "pipewire-0")); err == nil {
+			pipewireAvailable = true
+		}
+		if _, err := os.Stat(filepath.Join(runtimeDir, "pulse", "native")); err == nil {
+			pulseSocket = true
+		}
+	}
+	if pipewireAvailable {
+		methods = append(methods, "pipewire")
+	}
+	pulseAvailable := pulseSocket || strings.TrimSpace(os.Getenv("PULSE_SERVER")) != ""
+	if _, err := exec.LookPath("pactl"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		err := exec.CommandContext(ctx, "pactl", "info").Run()
+		cancel()
+		pulseAvailable = pulseAvailable || err == nil
+	}
+	if pulseAvailable {
+		methods = append(methods, "pulse")
+	}
+	return methods
 }
 
 type playbackProcess struct {
@@ -930,7 +1141,7 @@ func pollTerminalKey(timeout time.Duration) (string, bool, error) {
 // runManagedPlayback temporarily gives the visible terminal to the player and
 // optional visualizer while retaining raw input in jabberwock. Esc terminates
 // both child process groups and returns to the existing UI state.
-func (a *App) runManagedPlayback(playerCmd, visualCmd *exec.Cmd, title string) (stopped bool, playerErr, visualErr error) {
+func (a *App) runManagedPlayback(playerCmd *exec.Cmd, visualAttempts []cavaAttempt, title string) (stopped bool, playerErr, visualErr error) {
 	a.term.restore()
 	if err := a.term.enablePlaybackInput(); err != nil {
 		a.notice = "Could not listen for playback controls: " + err.Error()
@@ -940,27 +1151,46 @@ func (a *App) runManagedPlayback(playerCmd, visualCmd *exec.Cmd, title string) (
 		return false, err, nil
 	}
 	fmt.Printf("jabberwock — %s\r\n", title)
-	if visualCmd != nil {
-		fmt.Print("CAVA visuals are enabled. Press Esc to stop playback and return to jabberwock.\r\n\r\n")
+	if len(visualAttempts) > 0 {
+		fmt.Print("Starting CAVA audio monitor. Press Esc to stop playback and return to jabberwock.\r\n\r\n")
 	} else {
 		fmt.Print("Press Esc to stop playback and return to jabberwock.\r\n\r\n")
 	}
 
+	// Start CAVA first so it can attach to the system-output monitor before mpv
+	// begins producing audio. Try alternate capture backends if this CAVA build
+	// exits quickly because a requested backend is unavailable.
+	var visual *playbackProcess
+	var err error
+	for _, attempt := range visualAttempts {
+		visual, err = startPlaybackProcess(attempt.cmd)
+		if err != nil {
+			visualErr = err
+			fmt.Printf("CAVA (%s) could not start: %v\r\n", attempt.method, err)
+			continue
+		}
+		time.Sleep(450 * time.Millisecond)
+		if visual.collectIfDone() {
+			if visual.err != nil {
+				visualErr = fmt.Errorf("%s backend: %w", attempt.method, visual.err)
+				fmt.Printf("CAVA (%s) failed: %v; trying another backend.\r\n", attempt.method, visual.err)
+			}
+			visual = nil
+			continue
+		}
+		fmt.Printf("CAVA started (%s).\r\n", attempt.method)
+		visualErr = nil
+		break
+	}
 	player, err := startPlaybackProcess(playerCmd)
 	if err != nil {
 		playerErr = err
+		if visual != nil {
+			visual.stop()
+		}
 		fmt.Printf("Could not start mpv: %v\r\n", err)
 		a.finishPlaybackTerminal()
-		return false, playerErr, nil
-	}
-	var visual *playbackProcess
-	if visualCmd != nil {
-		visual, err = startPlaybackProcess(visualCmd)
-		if err != nil {
-			visualErr = err
-			fmt.Printf("CAVA could not start (%v); audio will continue without visuals.\r\n", err)
-			visual = nil
-		}
+		return false, playerErr, visualErr
 	}
 
 	for player.running {
@@ -1010,6 +1240,10 @@ func (a *App) finishPlaybackTerminal() {
 }
 
 func (a *App) render() {
+	if a.lyricsOpen {
+		a.renderLyrics()
+		return
+	}
 	if a.sourcePicker {
 		a.renderSourcePicker()
 		return
@@ -1040,8 +1274,11 @@ func (a *App) render() {
 	backendLabel := "LOCAL SCRAPE"
 	productLabel := "YouTube TUI"
 	if a.provider == "soundcloud" {
-		backendLabel = "SOUNDCLOUD TRACKS"
-		productLabel = "YouTube + SoundCloud TUI"
+		backendLabel = "SOUNDCLOUD TRACKS / SOUNDCLOAK"
+		productLabel = "YouTube + SoundCloud + Genius TUI"
+	} else if a.provider == "genius" {
+		backendLabel = "GENIUS LYRICS"
+		productLabel = "YouTube + SoundCloud + Genius TUI"
 	} else if a.cfg.Backend == "invidious" {
 		backendLabel = "INVIDIOUS API"
 	}
@@ -1060,7 +1297,11 @@ func (a *App) render() {
 	switch a.view {
 	case viewVideos:
 		if a.query == "" {
-			if a.provider == "soundcloud" {
+			if a.provider == "genius" {
+				lines = append(lines, "  Welcome to jabberwock Genius mode — search songs and read lyrics in the terminal.")
+				lines = append(lines, "  Ctrl+S searches songs; Enter opens the selected song's lyrics.")
+				lines = append(lines, "  Esc returns from lyrics to results; Ctrl+H returns Home without quitting.")
+			} else if a.provider == "soundcloud" {
 				lines = append(lines, "  Welcome to jabberwock SoundCloud mode — search, filter, and play tracks.")
 				lines = append(lines, "  Ctrl+S searches tracks; Enter plays with mpv, optionally alongside CAVA visuals.")
 				lines = append(lines, "  Press Esc during playback to stop mpv/CAVA and return here.")
@@ -1076,7 +1317,9 @@ func (a *App) render() {
 			lines = append(lines, "  No watch history or local subscriptions are stored.")
 		} else {
 			lines = append(lines, "  Query: "+clip(a.query))
-			if a.provider == "soundcloud" {
+			if a.provider == "genius" {
+				lines = append(lines, "  Search results from Genius. Select a song and press Enter to read lyrics.")
+			} else if a.provider == "soundcloud" {
 				lines = append(lines, "  Filters: sort="+a.filters.Sort+"  uploaded="+a.filters.Date+"  duration="+a.filters.Duration+"  playable tracks only")
 			} else {
 				lines = append(lines, "  Filters: sort="+a.filters.Sort+"  uploaded="+a.filters.Date+"  duration="+a.filters.Duration+"  hide-shorts="+onOff(a.filters.HideShorts))
@@ -1138,6 +1381,8 @@ func (a *App) render() {
 		options := filterOptions
 		if a.provider == "soundcloud" {
 			options = filterOptions[:3]
+		} else if a.provider == "genius" {
+			options = nil
 		}
 		for i, option := range options {
 			row := fmt.Sprintf("  %-14s  %s", option.Name, a.filters.labelAt(i))
@@ -1149,7 +1394,9 @@ func (a *App) render() {
 		}
 		lines = append(lines, "")
 		if a.provider == "soundcloud" {
-			lines = append(lines, paint(theme.Muted, "  SoundCloud search returns tracks only; blocked, preview-only, Go/subscriber-only, and non-progressive tracks are hidden."))
+			lines = append(lines, paint(theme.Muted, "  SoundCloud mode: API toggle selects Soundcloak or direct scraping; Go-only and blocked tracks are hidden."))
+		} else if a.provider == "genius" {
+			lines = append(lines, paint(theme.Muted, "  Genius searches songs by relevance. Select a result and press Enter to read lyrics."))
 		} else {
 			lines = append(lines, paint(theme.Muted, "  No Shorts: Shorts-marked results are hidden. Older Invidious instances may not label every Short."))
 		}
@@ -1157,23 +1404,24 @@ func (a *App) render() {
 		lines = append(lines, "  Settings are saved to: "+clip(a.cfgPath))
 		lines = append(lines, "  Select with ↑/↓; Enter or → changes the selected setting.")
 		lines = append(lines, "")
-		backend := "Local YouTube HTML scrape"
-		if a.cfg.Backend == "invidious" {
-			backend = "Invidious API"
+		apiMode := "Disabled — scrape original sites directly"
+		if a.cfg.UseAPIs {
+			apiMode = "Enabled — use public APIs/frontends"
 		}
-		scID := "Auto-detect"
-		if a.cfg.SoundCloudClientID != "" {
-			scID = a.cfg.SoundCloudClientID
+		scInstance := strings.TrimSpace(a.cfg.SoundCloudInstance)
+		if scInstance == "" {
+			scInstance = "Auto (instances.json)"
 		}
 		themeSetting := a.cfg.Theme
 		if a.provider == "soundcloud" {
 			themeSetting = a.cfg.SoundCloudTheme + " (SoundCloud)"
 		}
 		settings := []string{
-			"YouTube backend    " + backend,
-			"Invidious base URL " + a.cfg.InvidiousURL,
-			"Theme              " + themeSetting,
-			"SoundCloud client ID " + scID,
+			"Load through APIs     " + apiMode,
+			"Invidious base URL    " + a.cfg.InvidiousURL,
+			"Theme                 " + themeSetting,
+			"Soundcloak instance   " + scInstance,
+			"Genius frontend       " + a.cfg.GeniusFrontend + " (Dumb / Intellectual)",
 		}
 		for i, setting := range settings {
 			row := clip("  " + setting)
@@ -1184,9 +1432,9 @@ func (a *App) render() {
 			}
 		}
 		lines = append(lines, "")
-		lines = append(lines, paint(theme.Muted, "  Themes: add ANSI SGR palette entries in config.json, or call RegisterTheme in config.go."))
-		lines = append(lines, paint(theme.Muted, "  Keybinds: key -> action in config.json; Ctrl+P opens the source picker."))
-		lines = append(lines, paint(theme.Muted, "  SoundCloud client ID: auto-detected from web assets or edit it here if discovery fails."))
+		lines = append(lines, paint(theme.Muted, "  API mode applies to all sources: disabled scrapes the original sites directly; enabled uses Invidious, Soundcloak, and Dumb/Intellectual."))
+		lines = append(lines, paint(theme.Muted, "  Keybinds: key -> action in config.json; Ctrl+P opens the source picker; Ctrl+H returns Home."))
+		lines = append(lines, paint(theme.Muted, "  Genius frontend preference cycles Auto / Dumb / Intellectual when API mode is enabled."))
 	}
 
 	for len(lines) < height-3 {
@@ -1198,14 +1446,16 @@ func (a *App) render() {
 		if a.inputMode == "instance" {
 			prompt = "Invidious URL> "
 		} else if a.inputMode == "sc_client_id" {
-			prompt = "SoundCloud client ID> "
+			prompt = "SoundCloud client ID (legacy)> "
+		} else if a.inputMode == "soundcloak_instance" {
+			prompt = "Preferred Soundcloak URL (empty = auto)> "
 		}
 		lines = append(lines, paint(theme.Accent, "  "+prompt)+clip(string(a.input))+"█")
 	} else {
-		lines = append(lines, paint(theme.Muted, "  Tab: sections  ↑/↓: items  ←/→: options  Ctrl+S: search  Enter: select/play  Ctrl+Q: quit"))
+		lines = append(lines, paint(theme.Muted, "  Tab: sections  ↑/↓: items  ←/→: options  Ctrl+S: search  Enter: select/play  Ctrl+H: Home  Ctrl+Q: quit"))
 	}
 	statusCode := theme.Muted
-	if strings.HasPrefix(a.notice, "Search failed:") || strings.HasPrefix(a.notice, "SoundCloud search failed:") || strings.HasPrefix(a.notice, "Could not") || strings.Contains(a.notice, "not found") {
+	if strings.HasPrefix(a.notice, "Search failed:") || strings.HasPrefix(a.notice, "SoundCloud search failed:") || strings.HasPrefix(a.notice, "Genius search failed:") || strings.HasPrefix(a.notice, "Genius lyrics failed:") || strings.HasPrefix(a.notice, "Could not") || strings.Contains(a.notice, "not found") {
 		statusCode = theme.Error
 	}
 	status := "  " + a.notice
@@ -1247,7 +1497,7 @@ func (a *App) renderSourcePicker() {
 		"  Choose a source to open:",
 		"",
 	}
-	choices := []string{"YouTube", "SoundCloud"}
+	choices := []string{"YouTube", "SoundCloud", "Genius (lyrics)"}
 	for i, choice := range choices {
 		row := "    " + choice
 		if i == a.sourceSelected {
@@ -1256,9 +1506,132 @@ func (a *App) renderSourcePicker() {
 			lines = append(lines, paint(theme.Text, "    "+row))
 		}
 	}
-	lines = append(lines, "", paint(theme.Muted, "  ↑/↓ choose, Enter open, Ctrl+Q quit"), paint(theme.Muted, "  YouTube: HTML scrape or Invidious. SoundCloud: playable tracks only."), paint(theme.Muted, "  Tab switches Home / Filters / Settings; arrows move inside a section."))
+	lines = append(lines, "", paint(theme.Muted, "  ↑/↓ choose, Enter open, Ctrl+Q quit"), paint(theme.Muted, "  YouTube: videos. SoundCloud: tracks via Soundcloak. Genius: search/read lyrics."), paint(theme.Muted, "  Tab switches Home / Filters / Settings; arrows move inside a section."), paint(theme.Muted, "  Ctrl+H returns Home without quitting jabberwock."))
 	for len(lines) < height-2 {
 		lines = append(lines, "")
+	}
+	fmt.Print("\x1b[?25l\x1b[H\x1b[2J")
+	for _, line := range lines {
+		fmt.Print(line, "\r\n")
+	}
+}
+
+func (a *App) fetchGeniusPage() {
+	a.notice = "Searching Genius songs…"
+	a.render()
+	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
+	defer cancel()
+	a.geniusClient.UseAPI = a.cfg.UseAPIs
+	a.geniusClient.Frontend = a.cfg.GeniusFrontend
+	results, err := a.geniusClient.Search(ctx, a.query)
+	if err != nil {
+		a.notice = "Genius search failed: " + err.Error()
+		a.videos = nil
+		a.selected = 0
+		a.hasMore = false
+		return
+	}
+	videos := make([]Video, 0, len(results))
+	for _, song := range results {
+		videos = append(videos, Video{Title: song.Title, Author: song.Artist, VideoID: "genius:" + song.ID, WatchURL: song.URL, GeniusURL: song.URL, GeniusPath: song.Path, GeniusMirrorURL: song.MirrorURL, GeniusID: song.ID})
+	}
+	a.videos = videos
+	a.page = 1
+	a.cursor = SearchCursor{}
+	a.hasMore = false
+	a.selected = 0
+	if len(videos) == 0 {
+		a.notice = "No Genius song results found. Try another query."
+	} else {
+		a.notice = fmt.Sprintf("Found %d Genius song results. Press Enter to read lyrics.", len(videos))
+	}
+}
+
+func (a *App) openLyrics(video Video) {
+	a.notice = "Fetching lyrics for " + video.Title + "…"
+	a.render()
+	ctx, cancel := context.WithTimeout(context.Background(), 28*time.Second)
+	defer cancel()
+	a.geniusClient.UseAPI = a.cfg.UseAPIs
+	a.geniusClient.Frontend = a.cfg.GeniusFrontend
+	lyrics, err := a.geniusClient.Lyrics(ctx, genius.Song{ID: video.GeniusID, Title: video.Title, Artist: video.Author, URL: video.GeniusURL, Path: video.GeniusPath, MirrorURL: video.GeniusMirrorURL})
+	if err != nil {
+		a.notice = "Genius lyrics failed: " + err.Error()
+		return
+	}
+	a.lyricsSong = video
+	a.lyrics = lyrics
+	a.lyricsScroll = 0
+	a.lyricsOpen = true
+	a.notice = "Lyrics loaded. ↑/↓ scroll; Enter or c copies all lyrics; Esc returns to results; Ctrl+H returns Home."
+}
+
+func (a *App) copyLyrics() {
+	if strings.TrimSpace(a.lyrics) == "" {
+		a.notice = "No lyrics are loaded to copy."
+		return
+	}
+	method, err := copyTextToClipboard(a.lyrics)
+	if err != nil {
+		a.notice = "Could not copy lyrics: " + err.Error()
+		return
+	}
+	a.notice = "Full lyrics copied to clipboard via " + method + "."
+}
+
+func (a *App) renderLyrics() {
+	width, height := terminalSize()
+	if width < 48 {
+		width = 48
+	}
+	if height < 12 {
+		height = 12
+	}
+	theme := a.cfg.selectedThemeFor("genius")
+	paint := func(code, text string) string {
+		if code == "" {
+			return text
+		}
+		return "\x1b[" + code + "m" + text + "\x1b[0m"
+	}
+	clip := func(s string) string {
+		r := []rune(s)
+		if len(r) > width-4 {
+			return string(r[:max(0, width-7)]) + "…"
+		}
+		return s
+	}
+	lines := []string{
+		"  " + paint(theme.Title, "JABBERWOCK") + "  " + paint(theme.Accent, "GENIUS LYRICS"),
+		"  " + strings.Repeat("─", width-2),
+		"  " + paint(theme.Title, a.lyricsSong.Title),
+		"  " + paint(theme.Muted, a.lyricsSong.Author),
+		"  " + paint(theme.Selected, "[ Copy lyrics ]") + "  " + paint(theme.Muted, "press Enter or c to copy everything"),
+		"",
+	}
+	lyricLines := strings.Split(a.lyrics, "\n")
+	available := height - len(lines) - 3
+	if available < 1 {
+		available = 1
+	}
+	maxScroll := max(0, len(lyricLines)-available)
+	if a.lyricsScroll > maxScroll {
+		a.lyricsScroll = maxScroll
+	}
+	if a.lyricsScroll < 0 {
+		a.lyricsScroll = 0
+	}
+	end := min(len(lyricLines), a.lyricsScroll+available)
+	for i := a.lyricsScroll; i < end; i++ {
+		lines = append(lines, "  "+paint(theme.Text, clip(lyricLines[i])))
+	}
+	for len(lines) < height-2 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, paint(theme.Border, strings.Repeat("─", width-2)))
+	lines = append(lines, paint(theme.Muted, "  ↑/↓ scroll lyrics  Enter/c: Copy lyrics  Esc: results  Ctrl+H: Home  Ctrl+Q: quit"))
+	if len(lines) > height {
+		lines = lines[:height]
 	}
 	fmt.Print("\x1b[?25l\x1b[H\x1b[2J")
 	for _, line := range lines {
