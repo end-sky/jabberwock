@@ -21,4 +21,8 @@ type Video struct {
 	PublishedKnown  bool
 	PublishedText   string
 	IsShort         bool
+	GeniusURL       string
+	GeniusPath      string
+	GeniusMirrorURL string
+	GeniusID        string
 }
