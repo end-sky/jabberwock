@@ -23,13 +23,17 @@ type Theme struct {
 }
 
 type Config struct {
-	Backend            string            `json:"backend"` // "local" or "invidious"
-	InvidiousURL       string            `json:"invidious_url"`
-	SoundCloudClientID string            `json:"soundcloud_client_id,omitempty"`
-	Theme              string            `json:"theme"`
-	SoundCloudTheme    string            `json:"soundcloud_theme,omitempty"`
-	Themes             map[string]Theme  `json:"themes,omitempty"`
-	Keybinds           map[string]string `json:"keybinds,omitempty"` // key -> action
+	Backend                string            `json:"backend"` // synchronized with UseAPIs: local or invidious
+	UseAPIs                bool              `json:"use_apis"`
+	GeniusFrontend         string            `json:"genius_frontend,omitempty"` // auto, dumb, intellectual
+	InvidiousURL           string            `json:"invidious_url"`
+	SoundCloudClientID     string            `json:"soundcloud_client_id,omitempty"` // retained for old configs; Soundcloak is preferred
+	SoundCloudInstancesURL string            `json:"soundcloud_instances_url,omitempty"`
+	SoundCloudInstance     string            `json:"soundcloud_instance,omitempty"`
+	Theme                  string            `json:"theme"`
+	SoundCloudTheme        string            `json:"soundcloud_theme,omitempty"`
+	Themes                 map[string]Theme  `json:"themes,omitempty"`
+	Keybinds               map[string]string `json:"keybinds,omitempty"` // key -> action
 }
 
 type ActionHandler func(*App)
@@ -74,6 +78,7 @@ func init() {
 	RegisterKeybind("ctrl+q", "quit")
 	RegisterKeybind("ctrl+c", "quit")
 	RegisterKeybind("ctrl+p", "switch_source")
+	RegisterKeybind("ctrl+h", "home")
 	RegisterKeybind("tab", "next_view")
 	RegisterKeybind("/", "search")
 	RegisterKeybind("r", "refresh")
@@ -83,12 +88,15 @@ func init() {
 
 func DefaultConfig() Config {
 	return Config{
-		Backend:         "local",
-		InvidiousURL:    "https://yewtu.be",
-		Theme:           "wock",
-		SoundCloudTheme: "soundcloud",
-		Themes:          map[string]Theme{},
-		Keybinds:        map[string]string{},
+		Backend:                "invidious",
+		UseAPIs:                true,
+		GeniusFrontend:         "auto",
+		InvidiousURL:           "https://yewtu.be",
+		Theme:                  "wock",
+		SoundCloudTheme:        "soundcloud",
+		SoundCloudInstancesURL: "https://maid.zone/soundcloak/instances.json",
+		Themes:                 map[string]Theme{},
+		Keybinds:               map[string]string{},
 	}
 }
 
@@ -116,11 +124,23 @@ func LoadConfig() (Config, string, error) {
 		}
 		return cfg, path, fmt.Errorf("read config: %w", err)
 	}
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(data, &raw)
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, path, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if cfg.Backend != "invidious" {
+	// Preserve the pre-toggle experience for existing config files: before
+	// use_apis existed, SoundCloud/Genius used API-backed frontends by default.
+	if _, exists := raw["use_apis"]; !exists {
+		cfg.UseAPIs = true
+	}
+	if cfg.UseAPIs {
+		cfg.Backend = "invidious"
+	} else {
 		cfg.Backend = "local"
+	}
+	if cfg.GeniusFrontend != "dumb" && cfg.GeniusFrontend != "intellectual" && cfg.GeniusFrontend != "auto" {
+		cfg.GeniusFrontend = "auto"
 	}
 	if strings.TrimSpace(cfg.InvidiousURL) == "" {
 		cfg.InvidiousURL = DefaultConfig().InvidiousURL
@@ -132,6 +152,11 @@ func LoadConfig() (Config, string, error) {
 	if strings.TrimSpace(cfg.SoundCloudTheme) == "" {
 		cfg.SoundCloudTheme = "soundcloud"
 	}
+	if strings.TrimSpace(cfg.SoundCloudInstancesURL) == "" {
+		cfg.SoundCloudInstancesURL = "https://maid.zone/soundcloak/instances.json"
+	}
+	cfg.SoundCloudInstancesURL = strings.TrimSpace(cfg.SoundCloudInstancesURL)
+	cfg.SoundCloudInstance = strings.TrimRight(strings.TrimSpace(cfg.SoundCloudInstance), "/")
 	if cfg.Themes == nil {
 		cfg.Themes = map[string]Theme{}
 	}
